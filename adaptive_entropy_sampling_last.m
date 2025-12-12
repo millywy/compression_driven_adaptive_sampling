@@ -1,35 +1,32 @@
 % adaptive_entropy_sampling.m
 % Entropy-driven adaptive sampling atop the WFPV (TBME2017) pipeline.
-% Two modes: fs_hi=25 Hz, fs_lo=12.5 Hz. Raw data assumed at fs0=125 Hz.
+% Two modes: fs_hi=25 Hz, fs_lo=6.25 Hz. Raw data assumed at fs0=125 Hz.
 
-clear;  % close all;
+clear; % reset workspace before running script
 
 %% Configuration
 fs0 = 125;
 fs_hi = 25;
 fs_lo = 6.25;
-fs_proc = 25;                 % internal WFPV processing rate (matches original)
-FORCE_LOW = true;            % set true to sanity-check fixed Hz mode
-fs_acc = 25;                 % fixed-rate control stream for ACC
+fs_proc = 25;             % internal WFPV processing rate (matches original)
+FORCE_LOW = false;         % lock controller to low rate for BASELINE; set false to enable adaptation
+fs_acc = 25;              % fixed-rate control stream for ACC
 FFTres = 1024;
-WFlength = 15;          % Wiener averaging length (frames)
-CutoffFreqHzBP = [0.4 3];     % bandpass at 125 Hz before decimation
+WFlength = 15;            % Wiener averaging length (frames)
+CutoffFreqHzBP = [0.4 3];     % bandpass at 125 Hz before decimation (Nyquist at 3.125 Hz)
 CutoffFreqHzSearch = [1 3];   % HR search band (Hz)
 window_sec = 8;
 step_sec = 2;
-fs_next = fs_lo;   % initially low
 
-% Adaptive entropy thresholds / hysteresis (tunable)
-nbits_entropy = 2;            % quantization for entropy proxy
-hi_hold = 20;                 % min windows to stay high after going HIGH
-Th_hi = 0.15;                  % unstable = above this
-N_look_back = 7;               % windows to look back for stable entropy
-N_unstable = 2;                % unstable windows to go HIGH
-Th_low = 0.13;                 % stable = below this
-N_stable  = 5;                % min stable windows in high before going LOW
+% Adaptive entropy thresholds / hysteresis (tunable, should be parametrizable)
+nbits_entropy = 2;        % quantization for entropy proxy
+hi_hold = 20;             % min windows to stay high after going HIGH
+Th_hi = 0.15;             % unstable = above this
+N_look_back = 7;          % windows to look back for stable entropy
+N_unstable = 2;           % unstable windows to go HIGH
+Th_low = 0.13;            % stable = below this
+N_stable  = 5;            % min stable windows in high before going LOW
 
-
-DEBUG_LOG = false;            % set true to print per-window debug
 
 IDData = {'DATA_01_TYPE01','DATA_02_TYPE02','DATA_03_TYPE02','DATA_04_TYPE02',...
     'DATA_05_TYPE02','DATA_06_TYPE02','DATA_07_TYPE02','DATA_08_TYPE02','DATA_09_TYPE02',...
@@ -42,13 +39,12 @@ IDData = {'DATA_01_TYPE01','DATA_02_TYPE02','DATA_03_TYPE02','DATA_04_TYPE02',..
 [b125, a125] = butter(4, CutoffFreqHzBP/(fs0/2), 'bandpass');
 
 %% Metrics containers
-results = struct('fs', [], 'MAE_all', [], 'MAE_train', [], 'MAE_test', []);
 logRec = struct([]);
 myError = nan(1, numel(IDData));
 
 %% Process each recording
 for idnb = 1:numel(IDData)
-    % Load data
+    % Load data and pick PPG/ACC channels (dataset-specific)
     load(['Data/' IDData{idnb}], 'sig');
     if idnb > 13
         ch = [1 2 3 4 5];
@@ -58,40 +54,42 @@ for idnb = 1:numel(IDData)
 
     sig_raw = sig(ch, :);
 
+    % Sliding window setup (seconds -> samples)
     window = window_sec * fs0;
     step   = step_sec   * fs0;
     windowNb = floor((size(sig_raw,2)-window)/step) + 1;
 
     if windowNb < 1
+        % Skip very short recordings
         BPM_est = [];
         Hacc = [];
-        ACCmag25= [];
+        ACCmag25 = [];
         return;
     end
 
     BPM_est = zeros(1, windowNb);
     FsUsed  = zeros(1, windowNb);
-    Hacc    = zeros(1, windowNb);      % ACC entropy at fixed 25 Hz
-    dHacc = zeros(1, windowNb);         % ACC entropy diff (jump metric)
-    ACCmag25_log = zeros(1, windowNb); % mean ACC magnitude per window
+    Hacc    = zeros(1, windowNb);          % ACC entropy at fixed 25 Hz
+    dHacc = zeros(1, windowNb);            % ACC entropy diff (jump metric)
+    ACCmag25_log = zeros(1, windowNb);     % mean ACC magnitude per window
 
-    % Mode states (keep WF history per mode)
+    % Mode states (keep WF history per mode so HIGH/LOW do not mix)
     state_hi = init_mode_state();
     state_lo = init_mode_state();
     state_in = init_mode_state();
     state_out = init_mode_state();
-    fs_cur = fs_lo;   % start low
-    state_mode = "LOW";  % start low
-
-    rangeIdx = [];
-    clear W1_FFTi W11_FFTi W2_FFTi W21_FFTi W1_PPG_ave_FFT_Clean W2_PPG_ave_FFT_Clean W11_PPG_ave_FFT_Clean PPG_ave_FFT_FIN W21_PPG_ave_FFT_Clean PPG_ave_FFT_FIN;
+    fs_cur = fs_lo;                 % start low
+    fs_next = fs_lo;
+    state_mode = "LOW";             % start low
+    hi_timer = 0;                   % tracks how long we must stay HIGH
 
     
     for i = 1:windowNb
+        % Extract current frame from raw data
         curSegment = (i-1)*step+1 : (i-1)*step+window;
         curDataRaw = sig_raw(:, curSegment);
 
-        % Run one-frame WFPV with internal resampling (match baseline helper)
+        % Run one-frame WFPV with internal resampling (match baseline helper);
         % load in correct mode state
         if fs_cur == fs_hi
             state_in = state_hi;
@@ -108,13 +106,13 @@ for idnb = 1:numel(IDData)
             state_lo = state_out;
         end
 
-        % filter at 125 Hz
+        % Filter ACC at 125 Hz before downsampling
         curDataFilt2 = zeros(size(curDataRaw));
         for c = 1:size(curDataRaw,1)
             curDataFilt2(c,:) = filter(b125, a125, curDataRaw(c,:));
         end
 
-        % ACC control stream at fixed 25 Hz
+        % ACC control stream at fixed 25 Hz for entropy calculation
         curAcc_resampled = do_resample_last(curDataFilt2(3:5, :), fs0, fs_acc);
         ACCmag25 = sqrt(curAcc_resampled(1,:).^2 + curAcc_resampled(2,:).^2 + curAcc_resampled(3,:).^2);
         ACCmag25_log(i) = mean(ACCmag25);
@@ -125,12 +123,10 @@ for idnb = 1:numel(IDData)
             dHacc(i) = Hacc(i) - Hacc(i-1);
         end
 
-        % Adaptive sampling controller logic
+        % Adaptive sampling controller logic (simple hysteresis on entropy jumps)
         i0 = max(1, i - N_look_back + 1);
         recent = dHacc(i0:i);
         enough_hist = (i >= N_look_back);
-
-        trig_up = false; trig_down = false; unstable_at_lo = false; stable_at_hi = false; 
 
         % State machine controller
         if FORCE_LOW
@@ -140,10 +136,10 @@ for idnb = 1:numel(IDData)
                 case "LOW"
                     fs_cur = fs_lo;
                     if enough_hist
-                        n_bad = sum(abs(recent) > Th_hi);         % count unstable in last 5
+                        n_bad = sum(abs(recent) > Th_hi);         % count unstable windows in look-back
                         if n_bad >= N_unstable
                             state_mode = "HIGH";
-                            hi_timer = hi_hold;              % force HIGH for at least 15 windows
+                            hi_timer = hi_hold;              % force HIGH for at least hi_hold windows
                             fs_next = fs_hi;
                         end
                     end
@@ -167,14 +163,6 @@ for idnb = 1:numel(IDData)
         end
         FsUsed(i) = fs_next;
         fs_cur = fs_next;
-
-        % % Optional debug (toggle with DEBUG_LOG)
-        % if DEBUG_LOG
-        %     fprintf(['rec %02d win %03d mode=%s fs=%4.1f Hacc_s=%.3f dHraw=%.3f ', ...
-        %         'ThEnter=%.3f ThExit=%.3f sig=%.3f jump=%d level=%d dip=%d stable=%d upL=%d upJ=%d dn=%d cool=%d hold=%d\n'], ...
-        %         idnb, i, state_mode, fs_cur, Hacc_s(i), dHacc_raw(i), Th_enter, Th_exit, sigma_d, ...
-        %         trig_up_jump, trig_up_level, big_dip, stable, up_count_level, up_count_jump, down_count, cooldown, hi_hold);
-        % end
     end
     
 
@@ -216,7 +204,7 @@ fprintf(' ');
 fprintf('%4.2f ', myError);
 fprintf('\n');
 
-% Bland-Altman and correlation
+% Bland-Altman and correlation (aggregate all frames)
 fullBPM0 = [];
 fullBPM = [];
 for rr = 1:numel(logRec)
@@ -235,18 +223,18 @@ pct_hi = 100 * mean(all_fs_used==fs_hi);
 pct_lo = 100 * mean(all_fs_used==fs_lo);
 fprintf('Mode usage: high=%.1f%% low=%.1f%%\n', pct_hi, pct_lo);
 
+% Persist summary logs for later analysis
 save('adaptive_entropy_logs.mat', 'logRec', 'myError', 'MAE_all', 'MAE_train', 'MAE_test');
 
 %% Selected recordings for comparison
-selRecs = [7 15 19 21];
+selRecs = [5 7 15 21];
 for idx = 1:numel(selRecs)
     r = selRecs(idx);
     if r <= numel(logRec) && ~isempty(logRec(r).BPM0)
         win_count = numel(logRec(r).Hacc);
-        t_sec = (0:win_count-1) * step_sec; % window start times
         frames = 1:win_count;
 
-        % HR comparison
+        % HR comparison and controller signals
         figure;
         plot(logRec(r).BPM0,'ro'); hold on; 
         plot(logRec(r).BPM_est,'o','Color','blue'); 
@@ -262,33 +250,18 @@ for idx = 1:numel(selRecs)
         title(sprintf('Recording %d (Adaptive Entropy Sampling)', r));
         grid on;
 
-        % % Hacc and FsUsed over time (time axis in seconds, optional frame ticks on top)
-        % figure;
-        % yyaxis left; plot(frames, logRec(r).Hacc, '-'); ylabel('Hacc (bits)');
-        % yyaxis right; stairs(frames, logRec(r).FsUsed, '-'); ylabel('FsUsed (Hz)');
-        % xlabel('Time (frames)'); title(sprintf('Entropy & FsUsed - Recording %d', r));
-        % grid on;
-
-        % % Combined overlay: Hacc, dHacc_raw, FsUsed, ACC magnitude
-        % figure;
-        % ax1 = subplot(4,1,1); plot(frames, logRec(r).Hacc, '-'); ylabel('Hacc (bits)'); title(sprintf('Recording %d - Entropy & Sampling', r));
-        % ax2 = subplot(4,1,2); plot(frames, logRec(r).dHacc, '-'); ylabel('dHacc (bits)'); grid on;
-        % ax3 = subplot(4,1,3); stairs(frames, logRec(r).FsUsed, '-'); ylabel('FsUsed (Hz)'); grid on;
-        % ax4 = subplot(4,1,4); plot(frames, logRec(r).ACC_mag_25, '-'); ylabel('ACC mag'); xlabel('Time (frames)'); grid on;
-        % linkaxes([ax1 ax2 ax3 ax4],'x'); grid(ax1,'on');
-
     end
 end
 
 %% Helpers
 function state = init_mode_state()
+% Container for per-mode FFT/Wiener history so HIGH/LOW stay independent
 state.W1_FFTi = [];
 state.W11_FFTi = [];
 state.W2_FFTi = [];
 state.W21_FFTi = [];
 state.prevFFT = [];
 state.rangeIdx = [];
-state.FreqRange = [];
 end
 
 function [BPM_val, state] = wfpv_one_frame_last(curDataRaw, fs0, fs_adc, fs_proc, FFTres, WFlength, searchHz, state, i, BPM_est, idnb, bpHz)
@@ -313,7 +286,7 @@ PPG2 = curData(2, :);
 ACC_X = curData(3, :);
 ACC_Y = curData(4, :);
 ACC_Z = curData(5, :);
-PPG_ave = 0.5 * (PPG1 - mean(PPG1)) / (std(PPG1) + eps) + 0.5 * (PPG2 - mean(PPG2)) / (std(PPG2) + eps);
+PPG_ave = 0.5 * (PPG1 - mean(PPG1)) / (std(PPG1) + eps) + 0.5 * (PPG2 - mean(PPG2)) / (std(PPG2) + eps); % normalized PPG blend
 
 % Periodogram
 PPG_ave_FFT = fft(PPG_ave, FFTres);
@@ -326,7 +299,7 @@ ACC_X_FFT = fft(ACC_X, FFTres); ACC_X_FFT = ACC_X_FFT(lowR:highR);
 ACC_Y_FFT = fft(ACC_Y, FFTres); ACC_Y_FFT = ACC_Y_FFT(lowR:highR);
 ACC_Z_FFT = fft(ACC_Z, FFTres); ACC_Z_FFT = ACC_Z_FFT(lowR:highR);
 
-% Phase vocoder
+% Phase vocoder: keep frequency continuity between windows
 FreqRangePPG = FreqRange;
 if ~isempty(state.prevFFT) && length(state.prevFFT)==length(PPG_ave_FFT)
     for ii = 1:numel(FreqRangePPG)
@@ -343,7 +316,7 @@ end
 FreqRangePPG = moving(FreqRangePPG, 3);
 state.prevFFT = PPG_ave_FFT;
 
-% Wiener filtering history within mode
+% Wiener filters using per-mode history; ACC suppresses motion components
 WC1 = WFlength; WC2 = WFlength;
 
 state.W1_FFTi = [state.W1_FFTi; (abs(PPG_ave_FFT))/max(abs(PPG_ave_FFT)+eps)];
@@ -392,9 +365,9 @@ W11_PPG_ave_FFT_Clean = W11_PPG_ave_FFT_Clean / std(W11_PPG_ave_FFT_Clean + eps)
 W2_PPG_ave_FFT_Clean = W2_PPG_ave_FFT_Clean / std(W2_PPG_ave_FFT_Clean + eps);
 W21_PPG_ave_FFT_Clean = W21_PPG_ave_FFT_Clean / std(W21_PPG_ave_FFT_Clean + eps);
 
-PPG_ave_FFT_FIN = W1_PPG_ave_FFT_Clean + W2_PPG_ave_FFT_Clean;
+PPG_ave_FFT_FIN = W1_PPG_ave_FFT_Clean + W2_PPG_ave_FFT_Clean; % combine linear ACC-aware filters
 
-% History-tracked peak picking
+% History-tracked peak picking with adaptive search width
 hist_int = 25;
 if idnb > 12
     if i > 15, hist_int = max(abs(diff(BPM_est(max(1,i-15):i-1)))) + 5; end
@@ -417,11 +390,12 @@ state.rangeIdx(state.rangeIdx < 1) = [];
 state.rangeIdx(state.rangeIdx > length(FreqRange)) = [];
 
 if i > 5 && abs(BPM_val - BPM_est(i - 1)) > 5
+    % damp big jumps using a short linear trend
     ddd = polyfit(1:length(BPM_est(max(1, i - 5):i - 1)), BPM_est(max(1, i - 5):i - 1), 1);
     BPM_val = 0.8 * BPM_val + 0.2 * polyval(ddd, length(BPM_est(max(1, i - 5):i - 1)) + 1);
 end
 
-mul = 0.1;
+mul = 0.1; % gentle nudge along recent HR trend
 if i > 1
     prev_seq = BPM_est(max(1,i-7):i-1);
     if numel(prev_seq) > 1

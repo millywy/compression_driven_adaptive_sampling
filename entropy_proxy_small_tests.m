@@ -1,5 +1,5 @@
 %% Simple sanity checks for entropy proxy helpers
-% Run: >> entropy_proxy_sanity_checks
+% Run: >> entropy_proxy_small_tests
 
 rng(0);           % reproducible noise
 nbits = 3;

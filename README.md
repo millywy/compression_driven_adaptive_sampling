@@ -29,3 +29,6 @@ Entropy-driven adaptive sampling for wrist PPG/ACC using an adapted WFPV (Temko,
 ## Notes and acknowledgment
 - This codebase is heavily commented and cleaned with help from ChatGPT (Codex). Debugging and final design choices are mine; AI assistance was used for refactoring and documentation.
 - Baseline WFPV implementation and reference material: https://github.com/andtem2000/PPG (Temko et al., IEEE TBME 2017, “Accurate Heart Rate Monitoring During Physical Exercises Using PPG”). 
+
+## Poster
+<img width="823" height="732" alt="image" src="https://github.com/user-attachments/assets/50ce6113-eade-4c91-8389-51dfb96549bb" />

@@ -90,29 +90,30 @@ for idnb = 1:numel(IDData)
         curDataRaw = sig_raw(:, curSegment);
 
         % Run one-frame WFPV with internal resampling (match baseline helper);
-        % load in correct mode state
+        % 1)load in correct mode state
         if fs_cur == fs_hi
             state_in = state_hi;
         else
             state_in = state_lo;
         end
 
+        % 2) process HR in this frame using current mode
         [BPM_est(i), state_out] = wfpv_one_frame_last(curDataRaw, fs0, fs_cur, fs_proc, FFTres, WFlength, CutoffFreqHzSearch, state_in, i, BPM_est, idnb, CutoffFreqHzBP);
 
-        % Save back mode state
+        % 3) Save back mode state
         if fs_cur == fs_hi
             state_hi = state_out;
         else
             state_lo = state_out;
         end
 
-        % Filter ACC at 125 Hz before downsampling
+        % 4) Filter ACC at 125 Hz before downsampling
         curDataFilt2 = zeros(size(curDataRaw));
         for c = 1:size(curDataRaw,1)
             curDataFilt2(c,:) = filter(b125, a125, curDataRaw(c,:));
         end
 
-        % ACC control stream at fixed 25 Hz for entropy calculation
+        % 5) ACC control stream at fixed 25 Hz for entropy calculation
         curAcc_resampled = do_resample_last(curDataFilt2(3:5, :), fs0, fs_acc);
         ACCmag25 = sqrt(curAcc_resampled(1,:).^2 + curAcc_resampled(2,:).^2 + curAcc_resampled(3,:).^2);
         ACCmag25_log(i) = mean(ACCmag25);
@@ -123,7 +124,7 @@ for idnb = 1:numel(IDData)
             dHacc(i) = Hacc(i) - Hacc(i-1);
         end
 
-        % Adaptive sampling controller logic (simple hysteresis on entropy jumps)
+        % 6) Adaptive sampling controller logic (simple hysteresis on entropy jumps)
         i0 = max(1, i - N_look_back + 1);
         recent = dHacc(i0:i);
         enough_hist = (i >= N_look_back);
